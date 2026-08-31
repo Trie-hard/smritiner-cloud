@@ -1,5 +1,6 @@
 {
-  "buildCommand": "echo 'Deploying static portal'",
+  "framework": null,
+  "buildCommand": null,
   "outputDirectory": "static",
   "cleanUrls": true,
   "rewrites": [
