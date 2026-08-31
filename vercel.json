@@ -1,4 +1,5 @@
 {
+  "buildCommand": "echo 'Deploying static portal'",
   "outputDirectory": "static",
   "cleanUrls": true,
   "rewrites": [
