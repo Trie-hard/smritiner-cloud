@@ -4,7 +4,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -165,9 +165,11 @@ async def get_sbar(id: str, user: TokenData = Depends(require_role(["PRIMARY", "
     p = next((x for x in patients if x["id"] == id), None)
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
-    
-    current_theta = -1.49 if id == "00000000-0000-0000-0000-000000000002" else p["baseline_theta"]
-    sbar = irt_engine.generate_sbar_summary(p["full_name"], p["age"], p["baseline_theta"], current_theta)
+
+    trend = await db.get_patient_trend(id, days=30)
+    baseline = float(trend[0]["theta"]) if trend else float(p["baseline_theta"])
+    current = float(trend[-1]["theta"]) if trend else float(p["baseline_theta"])
+    sbar = irt_engine.generate_sbar_summary(p["full_name"], p["age"], baseline, current)
     return sbar
 
 @app.get("/portal/alerts")
@@ -180,19 +182,35 @@ async def get_recent_alerts(user: TokenData = Depends(require_role(["PRIMARY", "
 
 @app.get("/portal/alerts/stream")
 @app.get("/api/portal/alerts/stream")
-async def alerts_stream(user: TokenData = Depends(require_role(["PRIMARY", "SECONDARY"]))):
+async def alerts_stream(request: Request, token: Optional[str] = None):
+    """SSE stream. Accepts Authorization header or ?token= for EventSource clients."""
+    credentials = None
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.lower().startswith("bearer "):
+        from fastapi.security import HTTPAuthorizationCredentials
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=auth_header.split(" ", 1)[1])
+    elif token:
+        from fastapi.security import HTTPAuthorizationCredentials
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+    if credentials:
+        try:
+            await auth.get_current_user(credentials)
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid stream token")
+
     async def event_stream():
         queue = asyncio.Queue()
         _alert_subscribers.append(queue)
         try:
-            # Initial heartbeat / connection event
             yield "event: connected\ndata: {\"status\":\"connected\"}\n\n"
             while True:
                 data = await queue.get()
                 yield f"event: alert\ndata: {json.dumps(data)}\n\n"
         except asyncio.CancelledError:
-            _alert_subscribers.remove(queue)
-    
+            if queue in _alert_subscribers:
+                _alert_subscribers.remove(queue)
+
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 @app.post("/portal/caregiver/mutations", status_code=201)
@@ -219,53 +237,119 @@ async def create_mutation(body: MutationRequest, user: TokenData = Depends(requi
 @app.post("/sync/events")
 @app.post("/api/sync/events")
 async def push_sync(body: PushPayload, user: TokenData = Depends(require_role(["DEVICE", "PRIMARY", "SECONDARY"]))):
+    """Accept mobile elder push payloads (and legacy portal shapes)."""
     conn = await db.get_db()
     try:
         now = datetime.now(timezone.utc)
         synced_sessions = 0
         synced_events = 0
+        affected_patients: Dict[str, Tuple[float, Optional[float]]] = {}
 
-        # Upsert Sessions
+        # Upsert patient metadata when provided by the device
+        if body.patient and body.patient.get("id"):
+            await db.upsert_patient(conn, body.patient)
+
+        # Upsert Sessions — accept both mobile and legacy field names
         for s in body.sessions:
-            sess_id = s.get("session_id", f"sess_{int(now.timestamp())}")
-            pat_id = s.get("patient_id", user.patient_id or "00000000-0000-0000-0000-000000000001")
-            
-            # Compute IRT theta if responses provided
+            sess_id = s.get("session_id", f"sess_{int(now.timestamp())}_{synced_sessions}")
+            pat_id = (
+                s.get("patient_id")
+                or (body.patient or {}).get("id")
+                or user.patient_id
+                or "00000000-0000-0000-0000-000000000001"
+            )
+
             responses = s.get("responses", [])
-            theta_val, sem = irt_engine.estimate_theta_eap(responses) if responses else (s.get("final_theta", 0.0), 0.28)
+            if responses:
+                theta_val, sem = irt_engine.estimate_theta_eap(responses)
+            else:
+                theta_val = float(s.get("final_theta", s.get("initial_theta", 0.0)) or 0.0)
+                sem = float(s.get("sem", 0.28) or 0.28)
+
+            started_at = s.get("start_time") or s.get("started_at") or now.isoformat()
+            completed_at = s.get("end_time") or s.get("completed_at") or now.isoformat()
+            items_attempted = int(
+                s.get("total_trials")
+                if s.get("total_trials") is not None
+                else s.get("items_attempted", 0) or 0
+            )
+            items_correct = int(
+                s.get("successful_trials")
+                if s.get("successful_trials") is not None
+                else s.get("items_correct", 0) or 0
+            )
+
+            # Capture prior baseline before overwriting (for decline alerts)
+            prior_baseline = await db.get_patient_theta(conn, pat_id)
 
             await conn.execute("""
-                INSERT OR REPLACE INTO sessions (session_id, patient_id, game_type, started_at, completed_at, items_attempted, items_correct, final_theta, sem)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO sessions (
+                    session_id, patient_id, game_type, started_at, completed_at,
+                    items_attempted, items_correct, final_theta, sem
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                sess_id, pat_id, s.get("game_type", "reaction_time"),
-                s.get("started_at", now.isoformat()), s.get("completed_at", now.isoformat()),
-                s.get("items_attempted", 10), s.get("items_correct", 8),
-                theta_val, sem
+                sess_id, pat_id, s.get("game_type", "SMRITI_UDYAN"),
+                started_at, completed_at,
+                items_attempted, items_correct,
+                theta_val, sem,
             ))
             synced_sessions += 1
+            affected_patients[pat_id] = (theta_val, prior_baseline)
 
-        # Upsert Telemetry Events
+            await db.upsert_daily_theta_rollup(conn, pat_id, started_at, theta_val)
+            await db.update_patient_theta(conn, pat_id, theta_val, now.isoformat())
+
+        # Upsert Telemetry Events — accept event_id/payload/timestamp_utc from mobile
         for ev in body.events:
-            ev_id = ev.get("id", f"ev_{int(now.timestamp())}_{synced_events}")
-            pat_id = ev.get("patient_id", user.patient_id or "00000000-0000-0000-0000-000000000001")
+            ev_id = (
+                ev.get("event_id")
+                or ev.get("id")
+                or f"ev_{int(now.timestamp())}_{synced_events}"
+            )
+            pat_id = (
+                ev.get("patient_id")
+                or (body.patient or {}).get("id")
+                or user.patient_id
+                or "00000000-0000-0000-0000-000000000001"
+            )
+            event_payload = ev.get("payload")
+            if event_payload is None:
+                event_payload = ev.get("event_data", {})
+            if not isinstance(event_payload, (dict, list)):
+                event_payload = {"raw": event_payload}
+
             await conn.execute("""
-                INSERT OR REPLACE INTO patient_telemetry_events (id, session_id, patient_id, event_type, event_data, recorded_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO patient_telemetry_events (
+                    id, session_id, patient_id, event_type, event_data, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
             """, (
-                ev_id, ev.get("session_id", "sess_0"), pat_id,
+                ev_id,
+                ev.get("session_id", "sess_0"),
+                pat_id,
                 ev.get("event_type", "TOUCH_LATENCY"),
-                json.dumps(ev.get("event_data", {})),
-                ev.get("recorded_at", now.isoformat())
+                json.dumps(event_payload),
+                ev.get("timestamp_utc") or ev.get("recorded_at") or now.isoformat(),
             ))
             synced_events += 1
+
+        # Clinical alerts for sharp theta drops vs prior baseline
+        for pat_id, (new_theta, prior_baseline) in affected_patients.items():
+            alert = await db.maybe_create_decline_alert(
+                conn, pat_id, new_theta, now.isoformat(), prior_baseline=prior_baseline
+            )
+            if alert:
+                for queue in list(_alert_subscribers):
+                    try:
+                        queue.put_nowait(alert)
+                    except Exception:
+                        pass
 
         await conn.commit()
         return {
             "synced_sessions": synced_sessions,
             "synced_events": synced_events,
             "server_timestamp": now.isoformat(),
-            "status": "success"
+            "status": "success",
         }
     finally:
         await conn.close()

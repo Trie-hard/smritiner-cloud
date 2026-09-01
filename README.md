@@ -52,6 +52,15 @@ Within 1–2 minutes, Render will assign you a permanent 24/7 HTTPS domain:
 * **Direct APK Download**: `https://<your-service>.onrender.com/downloads/smritiner-elder-app.apk`
 * **Backend API Health**: `https://<your-service>.onrender.com/health`
 
+### Split deploy (Vercel frontend + Render API)
+1. Set Vercel env `VITE_API_URL` to your Render URL (example: `https://smritiner.onrender.com`) and redeploy.
+2. Rebuild the Android APK with  
+   `flutter build apk --release --dart-define=SYNC_GATEWAY_URL=https://<your-service>.onrender.com`
+3. If your Render hostname is not `smritiner.onrender.com`, update that URL in:
+   - `smritiner/web/caregiver_portal/.env.production`
+   - `smritiner/apps/mobile_elder/lib/core/constants.dart` (`productionSyncGatewayUrl`)
+   - Vercel rewrite destinations for APK downloads
+
 ### 🔑 Demo Caregiver Login:
 * **Phone Number / ID**: `+919876543210` (or `9876543210`)
 * **Password**: `demo123`

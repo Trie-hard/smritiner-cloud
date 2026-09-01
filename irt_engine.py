@@ -1,4 +1,5 @@
 import math
+from datetime import datetime, timezone
 from typing import List, Dict, Any
 
 def logistic_2pl(theta: float, a: float, b: float) -> float:
@@ -57,9 +58,9 @@ def generate_sbar_summary(patient_name: str, age: int, baseline_theta: float, cu
     return {
         "patient_name": patient_name,
         "age": age,
-        "situation": f"Patient demonstrates a 30-day cognitive ability score shift of {delta:+.2f} (Baseline θ: {baseline_theta:.2f} → Current θ: {current_theta:.2f}).",
-        "background": f"74-year-old enrolled in SmritiNER community cognitive screening CST protocol. Completed regular digital CST games.",
+        "situation": f"Patient demonstrates a cognitive ability score shift of {delta:+.2f} (Baseline θ: {baseline_theta:.2f} → Current θ: {current_theta:.2f}).",
+        "background": f"{age}-year-old enrolled in SmritiNER community cognitive screening CST protocol. Completed regular digital CST games.",
         "assessment": f"Severity Level: {severity}. {'Statistically significant downward trajectory in reaction time and working memory.' if severity != 'STABLE' else 'Cognitive ability stable within normal standard deviation limits.'}",
         "recommendation": "1. Schedule in-person formal MoCA / HMSE assessment.\n2. Review neuro-vascular risk factors and sleep hygiene.\n3. Adjust adaptive CST game difficulty parameters to prevent frustration.",
-        "generated_at": "2026-08-31T21:40:00Z"
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }

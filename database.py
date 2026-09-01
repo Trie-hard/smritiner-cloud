@@ -258,8 +258,27 @@ async def get_all_patients() -> List[Dict[str, Any]]:
                     p["session_count"] = s_row["sc"] if s_row else 30
                     p["last_session_time"] = s_row["lst"] if s_row and s_row["lst"] else p["created_at"]
                 
-                # Determine status
-                if p["id"] == "00000000-0000-0000-0000-000000000002":
+                # Determine status from theta trajectory when available
+                async with db.execute(
+                    "SELECT mean_theta FROM daily_theta_rollup WHERE patient_id = ? ORDER BY bucket ASC LIMIT 1",
+                    (p["id"],),
+                ) as cur_first:
+                    first = await cur_first.fetchone()
+                async with db.execute(
+                    "SELECT mean_theta FROM daily_theta_rollup WHERE patient_id = ? ORDER BY bucket DESC LIMIT 1",
+                    (p["id"],),
+                ) as cur_last:
+                    last = await cur_last.fetchone()
+
+                if first and last:
+                    delta = float(last["mean_theta"]) - float(first["mean_theta"])
+                    if delta <= -0.5:
+                        p["status"] = "DECLINING"
+                    elif delta <= -0.2:
+                        p["status"] = "ATTENTION"
+                    else:
+                        p["status"] = "STABLE"
+                elif p["id"] == "00000000-0000-0000-0000-000000000002":
                     p["status"] = "DECLINING"
                 else:
                     p["status"] = "STABLE"
@@ -300,3 +319,163 @@ async def get_alerts() -> List[Dict[str, Any]]:
             return [dict(r) for r in rows]
     finally:
         await db.close()
+
+
+async def upsert_patient(conn: aiosqlite.Connection, patient: Dict[str, Any]) -> None:
+    """Insert or update a patient row from a mobile push payload."""
+    now = datetime.now(timezone.utc).isoformat()
+    patient_id = patient.get("id")
+    if not patient_id:
+        return
+
+    async with conn.execute("SELECT id FROM patients WHERE id = ?", (patient_id,)) as cursor:
+        exists = await cursor.fetchone()
+
+    full_name = patient.get("full_name") or patient.get("name") or "Unknown"
+    age = int(patient.get("age") or 0)
+    lang = patient.get("primary_language") or "en"
+    theta = float(patient.get("baseline_theta") if patient.get("baseline_theta") is not None else 0.0)
+    phone = patient.get("caregiver_phone")
+
+    if exists:
+        await conn.execute("""
+            UPDATE patients
+            SET full_name = ?, age = ?, primary_language = ?,
+                baseline_theta = COALESCE(?, baseline_theta),
+                caregiver_phone = COALESCE(?, caregiver_phone),
+                updated_at = ?
+            WHERE id = ?
+        """, (full_name, age, lang, theta, phone, now, patient_id))
+    else:
+        await conn.execute("""
+            INSERT INTO patients (
+                id, full_name, age, primary_language, baseline_theta,
+                caregiver_phone, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (patient_id, full_name, age, lang, theta, phone, now, now))
+
+
+async def get_patient_theta(conn: aiosqlite.Connection, patient_id: str) -> Optional[float]:
+    async with conn.execute(
+        "SELECT baseline_theta FROM patients WHERE id = ?", (patient_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    return float(row["baseline_theta"])
+
+
+async def update_patient_theta(
+    conn: aiosqlite.Connection,
+    patient_id: str,
+    theta: float,
+    updated_at: str,
+) -> None:
+    await conn.execute(
+        "UPDATE patients SET baseline_theta = ?, updated_at = ? WHERE id = ?",
+        (theta, updated_at, patient_id),
+    )
+
+
+async def upsert_daily_theta_rollup(
+    conn: aiosqlite.Connection,
+    patient_id: str,
+    started_at: str,
+    theta: float,
+) -> None:
+    """Merge a session into the daily theta rollup bucket for trend charts."""
+    try:
+        day = started_at[:10]
+        if "T" not in started_at and len(started_at) < 10:
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    async with conn.execute(
+        "SELECT mean_theta, min_theta, max_theta, session_count, total_events "
+        "FROM daily_theta_rollup WHERE patient_id = ? AND bucket = ?",
+        (patient_id, day),
+    ) as cursor:
+        row = await cursor.fetchone()
+
+    if row:
+        prev_count = int(row["session_count"] or 0)
+        new_count = prev_count + 1
+        prev_mean = float(row["mean_theta"] or theta)
+        new_mean = round(((prev_mean * prev_count) + theta) / new_count, 3)
+        new_min = round(min(float(row["min_theta"] or theta), theta), 3)
+        new_max = round(max(float(row["max_theta"] or theta), theta), 3)
+        new_events = int(row["total_events"] or 0) + 1
+        await conn.execute("""
+            UPDATE daily_theta_rollup
+            SET mean_theta = ?, min_theta = ?, max_theta = ?,
+                session_count = ?, total_events = ?
+            WHERE patient_id = ? AND bucket = ?
+        """, (new_mean, new_min, new_max, new_count, new_events, patient_id, day))
+    else:
+        await conn.execute("""
+            INSERT INTO daily_theta_rollup (
+                patient_id, bucket, mean_theta, min_theta, max_theta,
+                session_count, total_events
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (patient_id, day, round(theta, 3), round(theta, 3), round(theta, 3), 1, 1))
+
+
+async def maybe_create_decline_alert(
+    conn: aiosqlite.Connection,
+    patient_id: str,
+    new_theta: float,
+    created_at: str,
+    prior_baseline: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Create a HIGH alert when theta drops ≥ 0.5 from the prior baseline."""
+    async with conn.execute(
+        "SELECT full_name, baseline_theta FROM patients WHERE id = ?",
+        (patient_id,),
+    ) as cursor:
+        patient = await cursor.fetchone()
+    if not patient:
+        return None
+
+    if prior_baseline is not None:
+        baseline = float(prior_baseline)
+    else:
+        async with conn.execute(
+            "SELECT mean_theta FROM daily_theta_rollup WHERE patient_id = ? "
+            "ORDER BY bucket ASC LIMIT 1",
+            (patient_id,),
+        ) as cursor:
+            first = await cursor.fetchone()
+        baseline = float(first["mean_theta"]) if first else float(patient["baseline_theta"] or 0.0)
+
+    delta = new_theta - baseline
+    if delta > -0.5:
+        return None
+
+    alert_id = f"alert-{patient_id[:8]}-{int(datetime.now().timestamp())}"
+    message = (
+        f"Cognitive ability (θ) dropped by {abs(delta):.2f} "
+        f"(baseline {baseline:.2f} → {new_theta:.2f})."
+    )
+    details = json.dumps({
+        "baseline": baseline,
+        "current": new_theta,
+        "delta": round(delta, 3),
+        "recommendation": "Conduct MoCA / HMSE evaluation",
+    })
+    await conn.execute("""
+        INSERT OR REPLACE INTO clinical_alerts (
+            id, patient_id, patient_name, alert_type, severity, message, details, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        alert_id, patient_id, patient["full_name"],
+        "RAPID_THETA_DECLINE", "HIGH", message, details, created_at,
+    ))
+    return {
+        "id": alert_id,
+        "patientId": patient_id,
+        "patient_name": patient["full_name"],
+        "message": message,
+        "severity": "high",
+        "timestamp": created_at,
+    }

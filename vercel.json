@@ -4,7 +4,7 @@
   "outputDirectory": "static",
   "cleanUrls": true,
   "rewrites": [
-    { "source": "/downloads/:match*", "destination": "/downloads/:match*" },
+    { "source": "/downloads/:match*", "destination": "https://smritiner.onrender.com/downloads/:match*" },
     { "source": "/assets/:match*", "destination": "/assets/:match*" },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
