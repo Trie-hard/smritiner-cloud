@@ -53,10 +53,15 @@ Within 1–2 minutes, Render will assign you a permanent 24/7 HTTPS domain:
 * **Backend API Health**: `https://<your-service>.onrender.com/health`
 
 ### Split deploy (Vercel frontend + Render API)
-1. Set Vercel env `VITE_API_URL` to your Render URL (example: `https://smritiner.onrender.com`) and redeploy.
-2. Rebuild the Android APK with  
-   `flutter build apk --release --dart-define=SYNC_GATEWAY_URL=https://<your-service>.onrender.com`
-3. If your Render hostname is not `smritiner.onrender.com`, update that URL in:
+Custom domains (recommended):
+- Portal: `https://nikshay.xyz` (Vercel)
+- API + APK: `https://api.nikshay.xyz` (Render)
+
+1. Attach `api.nikshay.xyz` on Render and `nikshay.xyz` / `www` on Vercel; update DNS at your registrar.
+2. Set Vercel env `VITE_API_URL=https://api.nikshay.xyz` and redeploy.
+3. Rebuild the Android APK with  
+   `flutter build apk --release --dart-define=SYNC_GATEWAY_URL=https://api.nikshay.xyz`
+4. Repo defaults already point at `api.nikshay.xyz` in:
    - `smritiner/web/caregiver_portal/.env.production`
    - `smritiner/apps/mobile_elder/lib/core/constants.dart` (`productionSyncGatewayUrl`)
    - Vercel rewrite destinations for APK downloads
